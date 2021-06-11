@@ -1,18 +1,39 @@
+import argparse
 from pdb import Pdb
-from unittest.mock import Mock
-from typing import Literal, Optional, Dict, Any, Tuple, Generator
-from types import FrameType
 from importlib import import_module
+from unittest.mock import Mock, AsyncMock
+import inspect
+from functools import partial
+from watchdog.events import FileSystemEventHandler
+from watchdog.observers import Observer
+from typing import Optional, Dict, Any, Tuple, Generator, List
+from types import FrameType
+
+
+try:
+    # >= Python 3.8
+    from typing import Literal
+except ImportError:
+    # < Python 3.8
+    from typing_extensions import Literal
+
+try:
+    # >= Python 3.9
+    from functools import cache
+except ImportError:
+    # < Python 3.9
+    from functools import lru_cache as cache
 
 
 VariableDescription = Literal['global', 'local']
 
 
-def import_string(dotted_path):
+@cache
+def import_string(dotted_path) -> object:
     """
     Import a dotted module path and return the attribute/class designated by the
     last name in the path. Raise ImportError if the import failed.
-    Taken from django.utils.module_loading with adjustment to allow modules to be given, not just attributes and classes
+    Taken from django.utils.module_loading with adjustment to allow modules to be returned, not just attributes and classes
     """
     try:
         module_path, class_name = dotted_path.rsplit('.', 1)
@@ -35,7 +56,8 @@ class ExtendedPdb(Pdb):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.monitor_mocks = {}
+        self._modules_with_mocks: Dict[str, object] = {}
+        self._monitor_mocks = {}
         self._mock_calls = {}
 
     @staticmethod
@@ -86,24 +108,31 @@ class ExtendedPdb(Pdb):
             self.on_new_side_effect(name, call, mock)
         self._mock_calls[name] = mock.call_args_list.copy()
 
-    def _check_side_effects(self):
-        for arg, module in self.monitor_mocks.items():
-            self._check_mock(arg, module)
-
-    def _register_mocks(self, arg: str, module: object) -> Generator[Tuple[str, Mock], None, None]:
-        if isinstance(module, Mock):
-            self.monitor_mocks[arg] = module
+    @staticmethod
+    def _find_mocks_in_object(arg: str, obj: object) -> Generator[Tuple[str, Mock], None, None]:
+        if isinstance(obj, Mock):
+            yield arg, obj
         else:
-            for name in dir(module):
-                attr = getattr(module, name, None)
+            for name in dir(obj):
+                attr = getattr(obj, name, None)
                 if isinstance(attr, Mock):
                     mock_name = f'{arg}.{name}'
-                    self.monitor_mocks[mock_name] = attr
                     yield mock_name, attr
 
-    def _register_mocks_from_string(self, path: str) -> Generator[Tuple[str, Mock], None, None]:
-        module = import_string(path)
-        yield from self._register_mocks(path, module)
+    def _find_mocks(self) -> Generator[Tuple[str, Mock], None, None]:
+        for name, obj in self._modules_with_mocks.items():
+            yield from self._find_mocks_in_object(name, obj)
+
+    def _check_side_effects(self):
+        for arg, mock in self._find_mocks():
+            self._check_mock(arg, mock)
+
+    def _register_mock_module_from_string(self, path: str) -> object:
+        if path not in self._modules_with_mocks:
+            obj = import_string(path)
+            self._modules_with_mocks[path] = obj
+            return obj
+        return self._modules_with_mocks[path]
 
     def do_pf_globals_changes(self, arg: str):
         self._monitor_changes(self._globals, self.curframe.f_globals, 'global')
@@ -114,12 +143,33 @@ class ExtendedPdb(Pdb):
         self._locals = self.curframe.f_locals.copy()
 
     def do_pf_side_effect(self, arg: str):
-        for name, module in self._register_mocks_from_string(arg):
-            self._check_mock(name, module)
+        obj = self._register_mock_module_from_string(arg)
+        for name, mock in self._find_mocks_in_object(arg, obj):
+            self._check_mock(arg, mock)
 
-    def do_register_mocks(self, arg: str):
+    def add_mocks(self, arg: str, keep_functionality: bool = True):
+        for item in arg.split(','):
+            attr = item.split('.')[-1]
+            module_string = arg.split(f'.{attr}')[0]
+            obj = self._register_mock_module_from_string(module_string)
+            value = getattr(obj, attr, None)
+            if value:
+                mock_class = AsyncMock if inspect.iscoroutinefunction(value) else Mock
+                side_effect = value if keep_functionality else None
+                setattr(obj, attr, mock_class(side_effect=side_effect))
+                print(f'Replaced {arg} with{mock_class.__name__}')
+            else:
+                print(f'There is no attribute called {attr} in {module_string}')
+
+    def do_pf_add_functional_mocks(self, arg: str):
+        self.add_mocks(arg, keep_functionality=True)
+
+    def do_pf_add_mocks(self, arg: str):
+        self.add_mocks(arg, keep_functionality=False)
+
+    def do_pf_register_mocks(self, arg: str):
         for mock in arg.split(','):
-            self._register_mocks_from_string(mock.strip())
+            self._register_mock_module_from_string(mock.strip())
 
     def do_pf_side_effects(self, arg: str):
         self._check_side_effects()
@@ -131,8 +181,6 @@ class AutomatedPdb(ExtendedPdb):
         self.rcLines.extend([f"tbreak {function}", "cont"])
         self.launch_cmdloop = False
         self.all_lines = True
-        self.monitor_mocks = {}
-        self._mock_calls = {}
 
     def _cmdloop(self) -> None:
         if self.launch_cmdloop:
@@ -160,14 +208,77 @@ class AutomatedPdb(ExtendedPdb):
         super().user_line(frame)
 
 
-def setup_mocks():
-    pass
+class ScriptFileHandler(FileSystemEventHandler):
+    def __init__(self, debugger: ExtendedPdb, module: str):
+        self.debugger = debugger
+        self._set_module_name(module)
+        self.debugger._runmodule(self.module)
+
+    def _set_module_name(self, script: str) -> None:
+        self.module = script.split('.py')[0]
+
+    def _reload(self):
+        self.debugger.do_quit("")
+        self.debugger._runmodule(self.module)
+
+    def on_moved(self, event):
+        print(f'Script was renamed to {event.dest_path}. Reloading.')
+        self._set_module_name(event.dest_path)
+        self._reload()
+
+    def on_deleted(self, event):
+        print(f'Script was deleted. Quitting')
+        self.debugger.do_quit("")
+
+    def on_modified(self, event):
+        print(f'Script was modified. Reloading.')
+        self._reload()
+
+
+def run_configuration(script: str, interactive: bool, breakpoints: List[str], tbreakpoints: List[str],
+                      commands: List[str], register_mocks: List[str], add_mocks: List[str],
+                      add_functional_mocks: List[str], watch: bool):
+    pdb_class = ExtendedPdb if interactive else AutomatedPdb
+    initial_commands = [f'tbreak {arg}' for arg in tbreakpoints] + [f'break {arg}' for arg in breakpoints]
+    dbg = pdb_class(initial_commands, commands)
+    for arg in add_mocks:
+        dbg.do_pf_add_mocks(arg)
+    for arg in add_functional_mocks:
+        dbg.do_pf_add_functional_mocks(arg)
+    for arg in register_mocks:
+        dbg.do_pf_register_mocks(arg)
+    if watch:
+        observer = Observer()
+        observer.schedule(partial(ScriptFileHandler, dbg, script), script)
+    else:
+        dbg._runmodule(script.split('.py')[-0])
 
 
 if __name__ == '__main__':
-    script = "script"
-    function = "validate"
-    condition = ""
-    setup_mocks()
-    dbg = AutomatedPdb(function)
-    dbg._runmodule(script)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('script', type=str, help="Python script to debug"),
+    parser.add_argument('-i', '--interactive', action='store_true', help='Open an interactive session.'),
+    parser.add_argument('-b, --breakpoint', type=str, help=f'Set a breakpoint', nargs="*"),
+    parser.add_argument('-t, --tbreakpoint', type=str, help=f'Set a once-off breakpoint', nargs="*"),
+    parser.add_argument('-c', '--command', type=str, nargs='*',
+                        help='Commands to run at each breakpoint')
+    parser.add_argument('-r', '--register-mocks', type=str, nargs='*',
+                        help='Register modules or classes which may contain mocks in comma separated lists')
+    parser.add_argument('-a', '--add-mocks', type=str, nargs='*',
+                        help='Add a mock')
+    parser.add_argument('-f', '--add-functional-mocks', type=str, nargs='*',
+                        help='Add a mock but retain existing functionality')
+    parser.add_argument('-w', '--watch', action='store_true',
+                        help='Watch for file changes and reload debugger accordingly')
+    args, kw = parser.parse_known_args()
+    run_configuration(
+        args.script,
+        args.interactive,
+        args.breakpoint,
+        args.tbreakpoint,
+        args.command,
+        args.register_mocks,
+        args.add_mocks,
+        args.add_functional_mocks,
+        args.watch
+    )
